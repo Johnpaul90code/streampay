@@ -11,12 +11,12 @@ reentrancy, TTL strategy, and the design decisions behind the v1 API. Read the
 │                        StreamingPayments                           │
 │                                                                    │
 │  lib.rs      entrypoints: create_stream / withdraw / withdraw_max / │
-│              cancel_stream / top_up / get_stream / available /      │
+│              cancel_stream / top_up / transfer / get_stream /      │
 │              recipient_streams / sender_streams                    │
 │  stream.rs   Stream type, storage, checked accrual math            │
 │  errors.rs   StreamError — stable numeric codes, append-only       │
 │  events.rs   StreamCreated / Withdrawn / StreamCancelled /         │
-│              StreamToppedUp (stream_id as topic)                   │
+│              StreamToppedUp / OwnershipProposed / OwnershipAccepted│
 └──────────────────────────┬─────────────────────────────────────────┘
                            │ token interface (SAC-compatible)
                            ▼
@@ -29,8 +29,10 @@ reentrancy, TTL strategy, and the design decisions behind the v1 API. Read the
 |---|---|---|
 | `DataKey::NextStreamId` | `u64` | monotonic id counter (ids start at 1) |
 | `DataKey::Stream(id)` | `Stream` | full per-stream state |
-| `DataKey::RecipientStreams(addr)` | `Vec<u64>` | append-only ids where `addr` receives |
-| `DataKey::SenderStreams(addr)` | `Vec<u64>` | append-only ids created by `addr` |
+| `DataKey::RecipientStreams(addr)` | `Vec<u64>` | ids currently owned by recipient `addr` |
+| `DataKey::SenderStreams(addr)` | `Vec<u64>` | ids currently owned by sender `addr` |
+| `DataKey::PendingSenderTransfer(id)` | `PendingTransfer` | expiring sender-role proposal |
+| `DataKey::PendingRecipientTransfer(id)` | `PendingTransfer` | expiring recipient-role proposal |
 
 Streams live in **persistent** storage. Every mutating entrypoint that touches
 a stream extends its TTL (`TTL_THRESHOLD_LEDGERS = 200_000`, extend to
@@ -43,13 +45,24 @@ stays hot.
 There is still **no global registry** of all streams (no contract-wide
 `Vec<u64>`): that would make `create_stream` cost grow with total stream count.
 Instead, discovery is **per-address**: `create_stream` appends the new id to
-the sender's and the recipient's own index lists — each bounded by that one
-user's activity, written only at creation, and paginated on read
+the sender's and recipient's index lists, then paginates on read
 (`recipient_streams` / `sender_streams`, `limit` clamped to
-`MAX_PAGE_SIZE = 50`). The indexes are *advisory*: never authorize against
-them; the `Stream` entry is the source of truth, and `StreamCreated` events
-remain the complete audit trail (an external indexer can still rebuild or
-cross-check the lists).
+`MAX_PAGE_SIZE = 50`). A proposal does not change indexes, so the prior owner
+remains listed until acceptance. Acceptance removes the id from the prior
+owner and appends it to the new owner's index in the same transaction.
+Therefore, after transfer, index order reflects ownership-acquisition order,
+not original stream creation. Terminal streams remain indexed. The indexes
+are *advisory*: never authorize against them; the `Stream` entry is the source
+of truth, and events remain the audit trail.
+
+Pending proposals store both proposer and target and expire after 100,000
+ledgers (about 5.8 days), shorter than stream state. The ledger deadline is
+checked explicitly because `extend_ttl` only lengthens entries; it cannot
+shorten an entry that starts with a longer TTL. Acceptance requires the
+target's authorization and verifies the proposer is still the current role
+owner. Missing or expired proposals return `TransferNotProposed`. Proposal TTL
+is extended only immediately after the key is written; missing keys are never
+passed to `extend_ttl`.
 
 ## 3. Accrual math
 
@@ -94,15 +107,21 @@ nothing has accrued, at `now ≥ end_time` the full duration has elapsed.
 | `withdraw` | recipient only | recipient |
 | `cancel_stream` | sender always; recipient iff `cancelable` | caller |
 | `top_up` | sender only | sender |
+| `propose_sender_transfer` | current sender only | current sender |
+| `accept_sender_transfer` | proposed sender only | proposed sender |
+| `propose_recipient_transfer` | current recipient only | current recipient |
+| `accept_recipient_transfer` | proposed recipient only | proposed recipient |
 
 The `cancelable` flag is chosen per stream at creation: payroll senders often
 want sender-only cancellation, while vesting recipients may want the right to
 walk away with what they've earned.
 
-`require_auth()` is called *before* any state reads that depend on the caller's
-identity, and errors use `StreamError` codes rather than SDK auth panics where
-the condition is a business rule (e.g. `NotAuthorized` for a stranger calling
-`cancel_stream`).
+`require_auth()` is called before mutations and is tied to the role address
+stored in the stream or proposal. Entry points with an explicit caller
+authorize that address before identity-dependent checks; transfer acceptance
+loads the pending target and then requires that target's authorization.
+Business-rule failures use `StreamError` codes (e.g. `NotAuthorized` for a
+stranger calling `cancel_stream`) rather than SDK auth panics.
 
 ## 5. Reentrancy: checks-effects-interactions
 
@@ -127,6 +146,15 @@ malicious-token test that attempts exactly this reentry.
 `≥ Σ (deposit − withdrawn)` across live streams. Funds enter only via
 `create_stream`/`top_up` and leave only via `withdraw`/`cancel_stream`, and
 every exit is bounded by the invariant `0 ≤ withdrawn ≤ streamed ≤ deposit`.
+
+**Transfer accounting proof sketch:** acceptance changes only the role address,
+its discovery index, and the pending-proposal key. It does not modify
+`deposit`, `withdrawn`, `start_time`, or `end_time`; therefore
+`streamed_at(deposit, duration, elapsed)` and `available = streamed - withdrawn`
+are identical immediately before and after acceptance, including mid-accrual.
+No tokens move during proposal or acceptance, so the escrow balance invariant
+is unchanged. Later withdrawals and cancellation use the new role addresses
+with the same accrual and split formulas.
 
 ## 6. Lifecycle states
 
@@ -169,6 +197,8 @@ the public interface:
 | 11 | `MathOverflow` | a checked computation would overflow |
 | 12 | `NotAuthorized` | caller is neither sender nor (cancelable) recipient |
 | 13 | `NothingToWithdraw` | `withdraw_max` with an empty accrued balance |
+| 14 | `TransferNotProposed` | ownership proposal is missing, expired, or stale |
+| 15 | `InvalidTransferTarget` | target is already the current owner |
 
 Codes are **append-only**: never renumber or reuse a variant.
 
@@ -191,12 +221,11 @@ spread over a longer window). v1 keeps top-up strictly additive — accrued
 amounts only grow. If demand exists, a `create_stream` from the remainder of a
 fully-streamed stream is the clean composition (roadmap).
 
-**No global stream registry; per-address append-only indexes instead.** See
-§2. A contract-wide id vector couples `create_stream` cost to total adoption
-and re-reads everything on every query; per-address lists keep writes O(1)
-for the one user involved and reads paginated. Discovery remains safe because
-the indexes are advisory only — auth and payouts always read the `Stream`
-entry itself.
+**No global stream registry; per-current-owner indexes instead.** See §2. A
+contract-wide id vector couples `create_stream` cost to total adoption and
+re-reads everything on every query; per-address lists keep writes local and
+reads paginated. Discovery remains safe because indexes are advisory only —
+auth and payouts always read the `Stream` entry itself.
 
 **Terminal states are terminal.** No reactivation, no partial cancellation.
 Simplicity is a security feature; richer flows belong in composing contracts

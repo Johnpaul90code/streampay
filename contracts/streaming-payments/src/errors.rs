@@ -41,4 +41,8 @@ pub enum StreamError {
     NotAuthorized = 12,
     /// `withdraw_max` found nothing accrued-but-unwithdrawn to pay out.
     NothingToWithdraw = 13,
+    /// No live ownership proposal exists for this role, or its proposer is stale.
+    TransferNotProposed = 14,
+    /// The proposed owner is already the current owner.
+    InvalidTransferTarget = 15,
 }

@@ -16,6 +16,8 @@
 //! - [`StreamingPayments::cancel_stream`] — sender (or recipient, if the
 //!   stream is `cancelable`) closes the stream with a pro-rata split
 //! - [`StreamingPayments::top_up`] — add funds to a running stream
+//! - `propose_sender_transfer` / `accept_sender_transfer` — hand off payer rights
+//! - `propose_recipient_transfer` / `accept_recipient_transfer` — redirect claims
 //! - [`StreamingPayments::get_stream`] / [`StreamingPayments::available`] —
 //!   read-only views
 //! - [`StreamingPayments::recipient_streams`] /
@@ -41,7 +43,10 @@ mod test_client;
 use soroban_sdk::{contract, contractimpl, token::TokenClient, Address, Env, Vec};
 
 pub use errors::StreamError;
-pub use events::{StreamCancelled, StreamCreated, StreamToppedUp, Withdrawn};
+pub use events::{
+    OwnershipAccepted, OwnershipProposed, OwnershipRole, StreamCancelled, StreamCreated,
+    StreamToppedUp, Withdrawn,
+};
 // `streamed_at` is re-exported for the fuzz target and downstream rate
 // calculators: it is a pure function requiring no `Env`.
 pub use stream::{streamed_at, Stream, StreamStatus, MAX_DURATION_SECONDS, MAX_PAGE_SIZE};
@@ -200,6 +205,9 @@ impl StreamingPayments {
             s.status = StreamStatus::Depleted;
         }
         stream::put_stream(env, s);
+        if s.status == StreamStatus::Depleted {
+            stream::clear_transfer_proposals(env, s.id);
+        }
 
         Withdrawn {
             stream_id: s.id,
@@ -250,6 +258,7 @@ impl StreamingPayments {
             .checked_add(recipient_amount)
             .ok_or(StreamError::MathOverflow)?;
         stream::put_stream(&env, &s);
+        stream::clear_transfer_proposals(&env, stream_id);
 
         StreamCancelled {
             stream_id,
@@ -329,6 +338,127 @@ impl StreamingPayments {
         Ok(())
     }
 
+    /// Proposes handing sender rights (top-up and sender cancellation) to `target`.
+    /// The current sender remains authoritative until the target accepts.
+    pub fn propose_sender_transfer(
+        env: Env,
+        stream_id: u64,
+        target: Address,
+    ) -> Result<(), StreamError> {
+        Self::propose_transfer(&env, stream_id, target, OwnershipRole::Sender)
+    }
+
+    /// Accepts a sender-role transfer proposed by the current sender.
+    pub fn accept_sender_transfer(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        Self::accept_transfer(&env, stream_id, OwnershipRole::Sender)
+    }
+
+    /// Proposes redirecting future claims and recipient rights to `target`.
+    /// The current recipient remains authoritative until the target accepts.
+    pub fn propose_recipient_transfer(
+        env: Env,
+        stream_id: u64,
+        target: Address,
+    ) -> Result<(), StreamError> {
+        Self::propose_transfer(&env, stream_id, target, OwnershipRole::Recipient)
+    }
+
+    /// Accepts a recipient-role transfer proposed by the current recipient.
+    pub fn accept_recipient_transfer(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        Self::accept_transfer(&env, stream_id, OwnershipRole::Recipient)
+    }
+
+    fn propose_transfer(
+        env: &Env,
+        stream_id: u64,
+        target: Address,
+        role: OwnershipRole,
+    ) -> Result<(), StreamError> {
+        let s = stream::get_stream(env, stream_id)?;
+        if s.status != StreamStatus::Active {
+            return Err(StreamError::StreamNotActive);
+        }
+        let owner = match role {
+            OwnershipRole::Sender => s.sender,
+            OwnershipRole::Recipient => s.recipient,
+        };
+        owner.require_auth();
+        if target == owner {
+            return Err(StreamError::InvalidTransferTarget);
+        }
+
+        stream::put_stream(env, &s);
+        let key = Self::transfer_key(stream_id, role);
+        stream::put_pending_transfer(env, &key, &owner, &target);
+        OwnershipProposed {
+            stream_id,
+            role,
+            current_owner: owner,
+            proposed_owner: target,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    fn accept_transfer(
+        env: &Env,
+        stream_id: u64,
+        role: OwnershipRole,
+    ) -> Result<(), StreamError> {
+        let mut s = stream::get_stream(env, stream_id)?;
+        if s.status != StreamStatus::Active {
+            return Err(StreamError::StreamNotActive);
+        }
+        let pending_key = Self::transfer_key(stream_id, role);
+        let pending = stream::get_pending_transfer(env, &pending_key)?;
+        let current_owner = match role {
+            OwnershipRole::Sender => &s.sender,
+            OwnershipRole::Recipient => &s.recipient,
+        };
+        if &pending.proposer != current_owner {
+            return Err(StreamError::TransferNotProposed);
+        }
+        pending.target.require_auth();
+
+        match role {
+            OwnershipRole::Sender => {
+                stream::transfer_index(
+                    env,
+                    &stream::DataKey::SenderStreams(s.sender.clone()),
+                    &stream::DataKey::SenderStreams(pending.target.clone()),
+                    stream_id,
+                );
+                s.sender = pending.target.clone();
+            }
+            OwnershipRole::Recipient => {
+                stream::transfer_index(
+                    env,
+                    &stream::DataKey::RecipientStreams(s.recipient.clone()),
+                    &stream::DataKey::RecipientStreams(pending.target.clone()),
+                    stream_id,
+                );
+                s.recipient = pending.target.clone();
+            }
+        }
+        stream::put_stream(env, &s);
+        stream::remove_pending_transfer(env, &pending_key);
+        OwnershipAccepted {
+            stream_id,
+            role,
+            previous_owner: pending.proposer,
+            new_owner: pending.target,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    fn transfer_key(stream_id: u64, role: OwnershipRole) -> stream::DataKey {
+        match role {
+            OwnershipRole::Sender => stream::DataKey::PendingSenderTransfer(stream_id),
+            OwnershipRole::Recipient => stream::DataKey::PendingRecipientTransfer(stream_id),
+        }
+    }
+
     /// Read-only view of a stream's full state.
     pub fn get_stream(env: Env, stream_id: u64) -> Result<Stream, StreamError> {
         stream::get_stream(&env, stream_id)
@@ -342,13 +472,14 @@ impl StreamingPayments {
         stream::available_amount(&env, &s)
     }
 
-    /// A page of stream ids where `recipient` is the recipient, in creation
-    /// order (oldest first). `limit` is clamped to `MAX_PAGE_SIZE`; paginate
-    /// by advancing `offset`. Unknown addresses yield an empty page.
+    /// A page of stream ids where `recipient` is the current recipient.
+    /// `limit` is clamped to `MAX_PAGE_SIZE`; paginate by advancing `offset`.
+    /// Unknown addresses yield an empty page.
     ///
-    /// Discovery view only: it does not authorize anything and terminal
-    /// (cancelled/depleted) streams keep their ids — read each stream's
-    /// `status` for lifecycle state.
+    /// Proposals do not move ids; accepting
+    /// a transfer removes the id from the old recipient and appends it to the
+    /// new recipient's index. Terminal streams remain indexed; read `status`
+    /// for lifecycle state. This view never authorizes an action.
     pub fn recipient_streams(env: Env, recipient: Address, offset: u32, limit: u32) -> Vec<u64> {
         stream::page_stream_ids(
             &env,
@@ -358,8 +489,10 @@ impl StreamingPayments {
         )
     }
 
-    /// A page of stream ids created by `sender`, in creation order. Same
-    /// pagination and advisory semantics as [`StreamingPayments::recipient_streams`].
+    /// A page of stream ids currently owned by `sender`. Accepted transfers
+    /// move ids to the new sender's index; they are appended at acceptance
+    /// time. Same pagination and advisory semantics as
+    /// [`StreamingPayments::recipient_streams`].
     pub fn sender_streams(env: Env, sender: Address, offset: u32, limit: u32) -> Vec<u64> {
         stream::page_stream_ids(&env, &stream::DataKey::SenderStreams(sender), offset, limit)
     }

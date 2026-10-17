@@ -28,6 +28,9 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 /// is actually being used never goes cold.
 const TTL_THRESHOLD_LEDGERS: u32 = 200_000; // extend when TTL drops below ~11.5 days
 const TTL_EXTEND_LEDGERS: u32 = 500_000; // extend to ~29 days
+const PROPOSAL_EXPIRY_LEDGERS: u32 = 100_000; // ~5.8 days
+const PROPOSAL_TTL_THRESHOLD_LEDGERS: u32 = 100_000;
+const PROPOSAL_TTL_EXTEND_LEDGERS: u32 = 120_000; // retain expired key briefly for cleanup
 
 /// Lifecycle state of a stream.
 #[contracttype]
@@ -60,6 +63,15 @@ pub struct Stream {
     pub status: StreamStatus,
 }
 
+/// A pending role transfer, bound to the owner who proposed it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTransfer {
+    pub proposer: Address,
+    pub target: Address,
+    pub expires_at_ledger: u32,
+}
+
 impl Stream {
     /// Seconds in the stream's full window. Always `>= 1` for a stored stream
     /// (`create_stream` rejects `end_time <= start_time`).
@@ -76,13 +88,17 @@ pub enum DataKey {
     NextStreamId,
     /// The stream with the given id.
     Stream(u64),
-    /// Append-only index of stream ids where the given address is the
-    /// recipient. Advisory (discovery) data: the `Stream` entries remain the
-    /// source of truth, and terminal streams keep their place in the index.
+    /// Current-recipient index of stream ids. Advisory (discovery) data: the
+    /// `Stream` entries remain the source of truth, and terminal streams keep
+    /// their place in the index.
     RecipientStreams(Address),
-    /// Append-only index of stream ids created (as sender) by the given
-    /// address. Same advisory semantics as [`DataKey::RecipientStreams`].
+    /// Current-sender index of stream ids. Same advisory semantics as
+    /// [`DataKey::RecipientStreams`].
     SenderStreams(Address),
+    /// Expiring proposal to transfer a stream's sender role.
+    PendingSenderTransfer(u64),
+    /// Expiring proposal to transfer a stream's recipient role.
+    PendingRecipientTransfer(u64),
 }
 
 /// Seconds elapsed of the stream window at the current ledger time.
@@ -198,11 +214,11 @@ pub fn put_stream(env: &Env, stream: &Stream) {
         .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
 }
 
-/// Appends a stream's id to both parties' address indexes.
+/// Appends a newly created stream's id to both parties' address indexes.
 ///
 /// Called once, from `create_stream`, right after the stream is persisted.
-/// Cancel/deplete/top-up flows intentionally do not touch the indexes: they
-/// are append-only discovery aids keyed by *creation*, not by lifecycle.
+/// Lifecycle changes do not touch the indexes; ownership acceptance moves the
+/// id between the current owners' indexes.
 pub fn index_stream(env: &Env, stream: &Stream) {
     push_to_index(
         env,
@@ -214,6 +230,71 @@ pub fn index_stream(env: &Env, stream: &Stream) {
         &DataKey::RecipientStreams(stream.recipient.clone()),
         stream.id,
     );
+}
+
+/// Moves an id between current-owner indexes after a transfer is accepted.
+/// Missing old entries are tolerated so indexes remain advisory, not auth state.
+pub fn transfer_index(env: &Env, old_key: &DataKey, new_key: &DataKey, id: u64) {
+    let storage = env.storage().persistent();
+    if let Some(old_ids) = storage.get::<_, Vec<u64>>(old_key) {
+        let mut retained = Vec::new(env);
+        for old_id in old_ids.iter() {
+            if old_id != id {
+                retained.push_back(old_id);
+            }
+        }
+        storage.set(old_key, &retained);
+        storage.extend_ttl(old_key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+    }
+    push_to_index(env, new_key, id);
+}
+
+/// Loads a pending proposal. Expired/missing entries are reported uniformly.
+pub fn get_pending_transfer(env: &Env, key: &DataKey) -> Result<PendingTransfer, StreamError> {
+    let transfer: PendingTransfer = env
+        .storage()
+        .persistent()
+        .get(key)
+        .ok_or(StreamError::TransferNotProposed)?;
+    if env.ledger().sequence() >= transfer.expires_at_ledger {
+        return Err(StreamError::TransferNotProposed);
+    }
+    Ok(transfer)
+}
+
+/// Stores a proposal with a shorter TTL than stream state. The key has just
+/// been written, so `extend_ttl` is safe here; callers must not extend it after
+/// a missing `get`, because Soroban rejects `extend_ttl` on absent keys.
+pub fn put_pending_transfer(
+    env: &Env,
+    key: &DataKey,
+    proposer: &Address,
+    target: &Address,
+) {
+    let storage = env.storage().persistent();
+    let transfer = PendingTransfer {
+        proposer: proposer.clone(),
+        target: target.clone(),
+        expires_at_ledger: env
+            .ledger()
+            .sequence()
+            .saturating_add(PROPOSAL_EXPIRY_LEDGERS),
+    };
+    storage.set(key, &transfer);
+    storage.extend_ttl(
+        key,
+        PROPOSAL_TTL_THRESHOLD_LEDGERS,
+        PROPOSAL_TTL_EXTEND_LEDGERS,
+    );
+}
+
+pub fn remove_pending_transfer(env: &Env, key: &DataKey) {
+    env.storage().persistent().remove(key);
+}
+
+pub fn clear_transfer_proposals(env: &Env, stream_id: u64) {
+    remove_pending_transfer(env, &DataKey::PendingSenderTransfer(stream_id));
+    remove_pending_transfer(env, &DataKey::PendingRecipientTransfer(stream_id));
 }
 
 fn push_to_index(env: &Env, key: &DataKey, id: u64) {
@@ -229,7 +310,7 @@ fn push_to_index(env: &Env, key: &DataKey, id: u64) {
         .extend_ttl(key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
 }
 
-/// Returns one page of stream ids from an address index, in creation order.
+/// Returns one page of stream ids from an address index, in index order.
 ///
 /// `limit` is clamped to [`MAX_PAGE_SIZE`]; an `offset` past the end (or an
 /// unknown address) yields an empty page rather than an error. Reading the

@@ -66,15 +66,24 @@ Deep dive (storage model, checked math, reentrancy, TTL strategy, design decisio
 | `withdraw_max(stream_id) → i128` | recipient | pays out all accrued, atomically | `Withdrawn` |
 | `cancel_stream(caller, stream_id)` | sender; recipient iff `cancelable` | pro-rata split, atomic | `StreamCancelled` |
 | `top_up(stream_id, amount)` | sender | pulls added funds | `StreamToppedUp` |
+| `propose_sender_transfer(stream_id, target)` | current sender | — | `OwnershipProposed` |
+| `accept_sender_transfer(stream_id)` | proposed sender | — | `OwnershipAccepted` |
+| `propose_recipient_transfer(stream_id, target)` | current recipient | — | `OwnershipProposed` |
+| `accept_recipient_transfer(stream_id)` | proposed recipient | — | `OwnershipAccepted` |
 | `get_stream(stream_id) → Stream` | — (read-only) | — | — |
 | `available(stream_id) → i128` | — (read-only) | — | — |
 | `recipient_streams(address, offset, limit) → Vec<u64>` | — (read-only) | — | — |
 | `sender_streams(address, offset, limit) → Vec<u64>` | — (read-only) | — | — |
 
-`recipient_streams` / `sender_streams` are on-chain discovery indexes:
-append-only, creation-ordered stream-id lists per address, paginated
-(`limit` clamped to `MAX_PAGE_SIZE = 50`). Terminal streams keep their ids —
-read each stream's `status` for lifecycle state.
+`recipient_streams` / `sender_streams` are on-chain current-owner discovery
+indexes, paginated (`limit` clamped to `MAX_PAGE_SIZE = 50`). Proposals leave
+the id with the current owner until acceptance; acceptance removes it from the
+old owner's index and appends it to the new owner's index. Thus ordering after
+a transfer reflects ownership acquisition, not original creation. Terminal
+streams keep their ids; read each stream's `status` for lifecycle state.
+Proposals expire after 100,000 ledgers (about 5.8 days). Transfers do not
+change `deposit`, `withdrawn`, or stream times, so mid-stream accrual is
+unchanged; see the accounting proof in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 Creating a stream requires a prior token approval: `token.approve(sender, <contract id>, deposit, exp)`. All failures return typed `StreamError` codes (no panics) — see `contracts/streaming-payments/src/errors.rs`.
 

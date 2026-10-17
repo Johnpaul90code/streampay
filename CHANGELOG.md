@@ -9,6 +9,17 @@ interface: they are only ever appended to, never renumbered or reused.
 
 ## [Unreleased]
 
+### Added
+- Two-step sender and recipient ownership transfers with target authorization,
+  expiring proposals, append-only ownership events, and current-owner index
+  updates on acceptance. Proposal acceptance leaves stream accrual/accounting
+  fields unchanged.
+- `StreamError::TransferNotProposed` (code 14) and
+  `StreamError::InvalidTransferTarget` (code 15), appended.
+- Discovery indexes now follow current role ownership; proposal does not move
+  an id, while acceptance removes it from the former owner and appends it for
+  the new owner.
+
 ## [0.3.0] - 2026-10-04
 
 ### Changed
@@ -40,7 +51,7 @@ interface: they are only ever appended to, never renumbered or reused.
 
 ### Added
 - On-chain address discovery indexes: `recipient_streams` and
-  `sender_streams` paginated views (append-only id lists per address,
+  `sender_streams` paginated views (id lists per address,
   creation-ordered, `MAX_PAGE_SIZE = 50`).
 - `withdraw_max(stream_id) -> i128` — atomically claim the full accrued
   balance in one call (no read-then-withdraw race).

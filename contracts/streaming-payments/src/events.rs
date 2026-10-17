@@ -3,7 +3,37 @@
 //! Every event is keyed by `stream_id` as a topic, so indexers can filter per
 //! stream efficiently. Non-`#[topic]` fields are event data.
 
-use soroban_sdk::{contractevent, Address};
+use soroban_sdk::{contractevent, contracttype, Address};
+
+/// Which stream role is being handed off.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OwnershipRole {
+    Sender,
+    Recipient,
+}
+
+/// Emitted when the current role owner proposes a transfer.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnershipProposed {
+    #[topic]
+    pub stream_id: u64,
+    pub role: OwnershipRole,
+    pub current_owner: Address,
+    pub proposed_owner: Address,
+}
+
+/// Emitted when the proposed owner accepts a transfer.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnershipAccepted {
+    #[topic]
+    pub stream_id: u64,
+    pub role: OwnershipRole,
+    pub previous_owner: Address,
+    pub new_owner: Address,
+}
 
 /// Emitted when a new stream is created and its deposit pulled in.
 #[contractevent]
