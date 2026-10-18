@@ -10,15 +10,18 @@ interface: they are only ever appended to, never renumbered or reused.
 ## [Unreleased]
 
 ### Added
-- Two-step sender and recipient ownership transfers with target authorization,
-  expiring proposals, append-only ownership events, and current-owner index
-  updates on acceptance. Proposal acceptance leaves stream accrual/accounting
-  fields unchanged.
-- `StreamError::TransferNotProposed` (code 14) and
-  `StreamError::InvalidTransferTarget` (code 15), appended.
-- Discovery indexes now follow current role ownership; proposal does not move
-  an id, while acceptance removes it from the former owner and appends it for
-  the new owner.
+- Frontend (opt-in) **fee-aware claim scheduling**: a recipient can queue a
+  signed `withdraw_max` intent and have the client submit it when the Soroban
+  inclusion-fee percentile drops under a budget, with a deadline fallback so a
+  deferred claim is never abandoned. New `frontend/lib/` modules
+  (`fee-stats.ts`, `fee-observer.ts`, `claim-scheduler.ts`, `claim-runtime.ts`,
+  `pending-queue.ts`, `use-claim-scheduler.ts`), a settings/queue panel on
+  `/stream/[id]`, and `docs/FEE_AWARE_CLAIMS.md` (constraints + decisions
+  tables). `pending-queue.ts` is the shared signed-intent queue that the PWA
+  offline queue (#48) must reuse.
+- Frontend unit + simulation tests (vitest): the claim-scheduler decision
+  ladder and a replay of a recorded fee series, committed as snapshot decision
+  tables; wired into the frontend CI job.
 - `indexer/` TypeScript service that decodes StreamPay Soroban events into a
   cursor-backed SQLite projection and exposes stream-by-id and address stream
   REST endpoints, with local setup/API documentation.
